@@ -4,7 +4,7 @@
 
 This repository is `@czottmann/pi-tensorx`, a Pi extension package that registers a `tensorx` provider for the [TensorX](https://tensorx.ai/) API (`https://api.tensorx.ai/v1`).
 
-On startup the extension fetches the TensorX model catalog, keeps the tool-capable models, and registers them with Pi using the `openai-completions` API adapter.
+On startup the extension fetches the TensorX model catalog, keeps the tool-capable models, and registers them with Pi using the `openai-completions` API adapter. When no API key is available to fetch the catalog, it registers a bundled snapshot instead.
 
 ## Important files
 
@@ -18,7 +18,7 @@ On startup the extension fetches the TensorX model catalog, keeps the tool-capab
 
 On load it fetches `GET https://api.tensorx.ai/v1/model/info`, keeps models with `supports_function_calling: true`, and registers them under the `tensorx` provider via `pi.registerProvider()` with the `openai-completions` adapter. Model metadata is derived from each entry's `model_info` (see `mapCatalog()`): `max_input_tokens` (falling back to `max_tokens`) becomes the context window, `max_output_tokens` becomes the max output, the `*_cost_per_token` fields become pi cost metadata (multiplied to per-million-token cost), `supports_vision` adds image input, and `supports_reasoning` marks a model as reasoning-capable. Duplicate model IDs in the catalog are de-duplicated, keeping the first.
 
-Unlike Cortecs, the TensorX catalog endpoint requires an API key, and pi does not expose the `/login`-stored key to extensions — so the live fetch only runs when `TENSORX_API_KEY` is set in the environment. Without it, the extension registers `FALLBACK_CATALOG`, a bundled snapshot of the catalog held in the API's native shape and mapped by the same `mapCatalog()`. The snapshot is not just for offline use: pi lists only providers that have at least one registered model under `/login` (it reads `modelRegistry.getAll()`), so with an empty list TensorX would not appear there at all. With the snapshot, TensorX shows under `/login` → API Keys and is usable with a saved key; the env var is only needed to refresh the catalog. Regenerate the snapshot from `GET /v1/model/info` when the catalog changes. Inference uses a saved API key from `/login` or `TENSORX_API_KEY`. The extension also registers `/tensorx-models` to list the registered models.
+The TensorX catalog endpoint requires an API key, and pi does not expose the `/login`-stored key to extensions — so the live fetch only runs when `TENSORX_API_KEY` is set in the environment. Without it, the extension registers `FALLBACK_CATALOG`, a bundled snapshot of the catalog held in the API's native shape and mapped by the same `mapCatalog()`. The snapshot is not just for offline use: pi lists only providers that have at least one registered model under `/login` (it reads `modelRegistry.getAll()`), so with an empty list TensorX would not appear there at all. With the snapshot, TensorX shows under `/login` → API Keys and is usable with a saved key; the env var is only needed to refresh the catalog. Regenerate the snapshot from `GET /v1/model/info` when the catalog changes. Inference uses a saved API key from `/login` or `TENSORX_API_KEY`. The extension also registers `/tensorx-models` to list the registered models.
 
 ## Development commands
 
