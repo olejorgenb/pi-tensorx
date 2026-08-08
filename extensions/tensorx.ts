@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "tensorx";
 const PROVIDER_DISPLAY_NAME = "TensorX";
 const BASE_URL = "https://api.tensorx.ai/v1";
+const PROVIDER_API = "openai-completions";
 const API_KEY_ENV_VAR = "TENSORX_API_KEY";
 const API_KEY_ENV_REF = `$${API_KEY_ENV_VAR}`;
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -52,6 +53,13 @@ type RegisteredModel = {
 	compat: { supportsDeveloperRole: boolean; maxTokensField: "max_tokens" };
 };
 
+// TensorX fronts OpenAI-compatible backends that don't accept the `developer`
+// role or `max_completion_tokens`.
+const MODEL_COMPAT = {
+	supportsDeveloperRole: false,
+	maxTokensField: "max_tokens",
+} as const satisfies RegisteredModel["compat"];
+
 function tokenCostToMillions(raw: number | string | null | undefined): number {
 	if (raw === null || raw === undefined) return 0;
 	const value = typeof raw === "number" ? raw : Number.parseFloat(raw);
@@ -79,10 +87,7 @@ function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
 		},
 		contextWindow,
 		maxTokens,
-		compat: {
-			supportsDeveloperRole: false,
-			maxTokensField: "max_tokens",
-		},
+		compat: MODEL_COMPAT,
 	};
 }
 
@@ -99,10 +104,6 @@ function mapCatalog(data: TensorXModel[]): RegisteredModel[] {
 	}
 	return models;
 }
-
-// Kept in sync by refreshModels; the slash command reads from here so it
-// always reflects the currently registered catalog.
-let currentModels: RegisteredModel[] = [];
 
 class CatalogFetchTimeoutError extends Error {
 	constructor() {
@@ -260,13 +261,86 @@ function readCachedModels(): RegisteredModel[] | undefined {
 		const models = (entry as { models?: unknown }).models;
 		if (!Array.isArray(models)) return undefined;
 
-		const validModels = models.filter(
-			(m): m is RegisteredModel => typeof (m as { id?: unknown } | null)?.id === "string",
-		);
+		// The store holds what toStoredModel() wrote, so run the entries back
+		// through fromStoredModel() — same as the refresh hook's `context.stored`
+		// restore — to drop the provider-level fields pi reapplies itself.
+		const validModels = models
+			.filter((m): m is StoredModel => typeof (m as { id?: unknown } | null)?.id === "string")
+			.map(fromStoredModel);
 		return validModels.length > 0 ? validModels : undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+// pi hands the resolved credential to refreshModels() rather than exposing it
+// to extensions ambiently, so these types come from the hook's own signature.
+// Derived from ProviderConfig to avoid a direct @earendil-works/pi-ai dependency.
+type RefreshContext = Parameters<NonNullable<ProviderConfig["refreshModels"]>>[0];
+type StoredCatalog = NonNullable<Parameters<RefreshContext["publish"]>[0]["persist"]>;
+type StoredModel = StoredCatalog["models"][number];
+
+// The models pi currently knows about. Seeded at load, replaced by a successful
+// refresh, and returned by refreshModels() when a refresh can't improve on it —
+// returning a shorter list would drop models pi already offers.
+let currentModels: RegisteredModel[] = [];
+
+function credentialApiKey(credential: RefreshContext["credential"]): string | undefined {
+	return credential?.type === "api_key" ? credential.key : undefined;
+}
+
+// The persisted catalog holds fully-resolved models; the provider-level fields
+// pi would otherwise apply from the registration are baked in here.
+function toStoredModel(model: RegisteredModel): StoredModel {
+	return { ...model, provider: PROVIDER_NAME, api: PROVIDER_API, baseUrl: BASE_URL };
+}
+
+// Drops the provider-level fields toStoredModel() baked in; pi reapplies them
+// from the registration when the returned list is composed.
+function fromStoredModel(model: StoredModel): RegisteredModel {
+	return {
+		id: model.id,
+		name: model.name,
+		reasoning: model.reasoning,
+		input: model.input,
+		cost: model.cost,
+		contextWindow: model.contextWindow,
+		maxTokens: model.maxTokens,
+		compat: MODEL_COMPAT,
+	};
+}
+
+// Dynamic catalog hook. pi calls this without network access on startup and
+// after credential changes, and with it when the user opens /model or runs
+// `pi update --models`. Persisting means the next session starts from the live
+// catalog instead of the snapshot.
+async function refreshModels(context: RefreshContext): Promise<RegisteredModel[]> {
+	const stored = context.stored?.models;
+	if (stored?.length) currentModels = stored.map(fromStoredModel);
+
+	// A key from /login arrives on the context; the env var stays supported so
+	// TENSORX_API_KEY keeps working for anyone already relying on it.
+	const apiKey = credentialApiKey(context.credential) ?? process.env[API_KEY_ENV_VAR];
+	if (!context.allowNetwork || !apiKey) return currentModels;
+
+	const fetched = await fetchModels(apiKey, context.signal);
+	if (!fetched?.length) return currentModels;
+
+	// publish() is generation-checked: `update` runs only if this refresh is
+	// still the current one, so the in-memory list can't outrun what was stored.
+	// A store failure must not fail the refresh, so it is logged and ignored —
+	// the fetched list is still what pi gets.
+	try {
+		await context.publish({
+			persist: { models: fetched.map(toStoredModel), checkedAt: Date.now() },
+			update: () => {
+				currentModels = fetched;
+			},
+		});
+	} catch (error) {
+		console.warn(`[${PROVIDER_NAME}] Failed to persist model catalog:`, error);
+	}
+	return fetched;
 }
 
 // Snapshot of the tool-capable TensorX catalog, in the API's native shape so it
@@ -339,55 +413,16 @@ export default async function (pi: ExtensionAPI) {
 		name: PROVIDER_DISPLAY_NAME,
 		baseUrl: BASE_URL,
 		apiKey: API_KEY_ENV_REF,
-		api: "openai-completions",
+		api: PROVIDER_API,
 		models: currentModels,
-		refreshModels: async (context) => {
-			// Pi calls refreshModels at startup and after /login in
-			// interactive sessions, first with allowNetwork=false to restore
-			// the persisted catalog, then with network access and the
-			// effective credential. Without a usable key we keep the current
-			// list; the provider stays visible in /login either way.
-			if (!context.allowNetwork) {
-				// Cold start with an unreachable API: seed from the persisted
-				// last-known-good catalog instead of publishing an empty list.
-				if (currentModels.length === 0 && context.stored && Array.isArray(context.stored.models)) {
-					currentModels = context.stored.models as unknown as RegisteredModel[];
-				}
-				return currentModels;
-			}
-
-			const credential = context.credential;
-			if (credential?.type !== "api_key" || !credential.key) return currentModels;
-
-			const refreshed = await fetchModels(credential.key, context.signal);
-			// Keep the last-known-good list when the fetch fails; the provider
-			// must not lose its models because of a transient outage.
-			if (!refreshed) return currentModels;
-
-			currentModels = refreshed;
-			// Write-through: persist the catalog so a later session can restore
-			// it offline. The cast is required because pi-ai's
-			// ModelsStoreEntry/Model types are not re-exported by
-			// pi-coding-agent; only this extension writes and reads the
-			// provider's store entry, so the shapes always match. A store
-			// failure must not fail the refresh, so it is logged and ignored.
-			try {
-				const entry = {
-					models: refreshed,
-					checkedAt: Date.now(),
-				} as unknown as Parameters<typeof context.publish>[0]["persist"];
-				await context.publish({ persist: entry });
-			} catch (error) {
-				console.warn(`[${PROVIDER_NAME}] Failed to persist model catalog:`, error);
-			}
-
-			return refreshed;
-		},
+		refreshModels,
 	});
 
 	pi.registerCommand("tensorx-models", {
 		description: "List available TensorX models",
 		handler: async (_args, ctx) => {
+			// Read currentModels, not the load-time list: a refresh may have
+			// replaced it since.
 			if (currentModels.length === 0) {
 				ctx.ui.notify("No TensorX models available", "warning");
 				return;
