@@ -4,6 +4,8 @@
 
 - The catalog persisted to pi's `models-store.json` now carries the provider, API, and base URL fields pi's model store expects, instead of being written through an unchecked cast; restoring a stored catalog goes through the same typed shape. Requires pi 0.84.0 or newer for the `context.stored` / `context.publish()` refresh API.
 - Catalog updates are applied through `context.publish({ update })`, which is generation-checked, so a superseded refresh can no longer overwrite a newer model list.
+- De-duplicates model IDs that differ only in case, keeping the all-lowercase spelling, so models like `moonshotai/kimi-k2.6` no longer appear twice in the model picker.
+- Warns instead of silently pricing a model at zero when the catalog reports an unparsable `*_cost_per_token` value.
 
 ## 1.1.0 - 2026-08-09
 
