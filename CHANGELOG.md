@@ -6,6 +6,7 @@
 - Catalog updates are applied through `context.publish({ update })`, which is generation-checked, so a superseded refresh can no longer overwrite a newer model list.
 - De-duplicates model IDs that differ only in case, keeping the all-lowercase spelling, so models like `moonshotai/kimi-k2.6` no longer appear twice in the model picker.
 - Warns instead of silently pricing a model at zero when the catalog reports an unparsable `*_cost_per_token` value.
+- Removes the bundled catalog snapshot. It existed because pi was believed to list only providers with at least one registered model under `/login`; that is not the case in pi 0.84, so the provider now registers with the catalog persisted from an earlier session — or with no models at all — when no key is available at load, and `refreshModels()` populates it once one exists. This drops a copy of the catalog that could — and did — drift from the live pricing data.
 
 ## 1.1.0 - 2026-08-09
 
