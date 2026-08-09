@@ -36,7 +36,7 @@ export TENSORX_API_KEY=your-key-here
 
 TensorX uses static API keys, so it appears under API keys in `/login`, not under subscriptions.
 
-Note: the live catalog endpoint requires a key, and pi does not hand the `/login`-stored key to extensions. So the up-to-date catalog only loads when `TENSORX_API_KEY` is set in your environment. Without it, the extension registers a bundled snapshot of the catalog — enough to log in via `/login` and use the models. Set `TENSORX_API_KEY` if you want the current catalog instead of the snapshot.
+Note: the live catalog endpoint requires a key. In interactive sessions pi refreshes the catalog after login, using the key you saved via `/login` — no restart needed. `TENSORX_API_KEY` is only required to load the live catalog in non-interactive modes (`pi --list-models` does not refresh catalogs) or before the first login. Without any key, the extension registers a bundled snapshot of the catalog — enough to log in via `/login` and use the models.
 
 ## Use
 
@@ -56,7 +56,7 @@ In interactive mode, `/tensorx-models` lists the TensorX models registered by th
 
 ## How it works
 
-On startup, the extension fetches `GET https://api.tensorx.ai/v1/model/info`, keeps models that report `supports_function_calling`, and registers them with `pi.registerProvider()` using pi's `openai-completions` API adapter.
+The extension registers the `tensorx` provider on startup via `pi.registerProvider()` using pi's `openai-completions` API adapter, keeping only models that report `supports_function_calling`. When `TENSORX_API_KEY` is set, the catalog is fetched at load; in interactive sessions pi also refreshes the catalog after `/login` using the saved key, so new models appear without a restart.
 
 Model metadata comes from each entry's `model_info`:
 
@@ -68,7 +68,7 @@ Model metadata comes from each entry's `model_info`:
 
 Duplicate model IDs in the catalog are de-duplicated, keeping the first.
 
-If `TENSORX_API_KEY` is not in the environment, the extension can't reach the catalog endpoint, so it registers a bundled snapshot of the catalog instead. The snapshot is what lets TensorX appear under `/login` → API Keys: pi only lists providers that have registered models. Inference needs either a saved API key from `/login` or `TENSORX_API_KEY`.
+The catalog fetch calls `GET https://api.tensorx.ai/v1/model/info`. Fetches have a per-attempt timeout and retry transient failures (network errors, timeouts, HTTP 429/5xx, invalid responses) with backoff. Without `TENSORX_API_KEY` (or when the fetch fails), the extension registers a bundled snapshot of the catalog instead — the snapshot is what lets TensorX appear under `/login` → API Keys: pi only lists providers that have registered models. The last successfully loaded catalog is persisted and restored at startup, so models stay selectable even when the API is unreachable — the cached catalog appears in the model picker immediately, while a refresh is still running in the background. Note that non-interactive runs (`pi --list-models`) do not refresh provider catalogs, so in those modes models come from the `TENSORX_API_KEY` pre-fetch, the persisted catalog, or the snapshot. Inference needs either a saved API key from `/login` or `TENSORX_API_KEY`.
 
 ## Development
 
