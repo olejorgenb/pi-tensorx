@@ -8,6 +8,9 @@ const API_KEY_ENV_VAR = "TENSORX_API_KEY";
 const API_KEY_ENV_REF = `$${API_KEY_ENV_VAR}`;
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32768;
+// The load-time fetch blocks pi's startup, so it gets a deadline. The refresh
+// hook's fetch is bounded by pi's own signal instead.
+const LOAD_FETCH_TIMEOUT_MS = 5000;
 // TensorX reports costs per token; pi expects cost per million tokens.
 const COST_PER_MILLION = 1_000_000;
 
@@ -51,10 +54,14 @@ const MODEL_COMPAT = {
 	maxTokensField: "max_tokens",
 } as const satisfies RegisteredModel["compat"];
 
-function tokenCostToMillions(raw: number | string | null | undefined): number {
+function tokenCostToMillions(raw: number | string | null | undefined, field: string, modelId: string): number {
 	if (raw === null || raw === undefined) return 0;
 	const value = typeof raw === "number" ? raw : Number.parseFloat(raw);
-	return Number.isFinite(value) ? value * COST_PER_MILLION : 0;
+	if (Number.isFinite(value)) return value * COST_PER_MILLION;
+	// pi's model shape requires a number, so an unparsable rate has to become 0.
+	// Say so rather than silently reporting the model as free.
+	console.warn(`[${PROVIDER_NAME}] ${modelId}: unparsable ${field} (${JSON.stringify(raw)}), treating as 0`);
+	return 0;
 }
 
 function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
@@ -71,10 +78,18 @@ function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
 		reasoning: info.supports_reasoning === true,
 		input,
 		cost: {
-			input: tokenCostToMillions(info.input_cost_per_token),
-			output: tokenCostToMillions(info.output_cost_per_token),
-			cacheRead: tokenCostToMillions(info.cache_read_input_token_cost),
-			cacheWrite: tokenCostToMillions(info.cache_creation_input_token_cost),
+			input: tokenCostToMillions(info.input_cost_per_token, "input_cost_per_token", model.model_name),
+			output: tokenCostToMillions(info.output_cost_per_token, "output_cost_per_token", model.model_name),
+			cacheRead: tokenCostToMillions(
+				info.cache_read_input_token_cost,
+				"cache_read_input_token_cost",
+				model.model_name,
+			),
+			cacheWrite: tokenCostToMillions(
+				info.cache_creation_input_token_cost,
+				"cache_creation_input_token_cost",
+				model.model_name,
+			),
 		},
 		contextWindow,
 		maxTokens,
@@ -84,16 +99,23 @@ function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
 
 // Keep tool-capable models, drop duplicate IDs (the catalog has a few), map to
 // pi's model shape. Used for both the live catalog and the fallback snapshot.
+//
+// Some duplicates differ only in case — the catalog has shipped both
+// `moonshotai/Kimi-K2.6` and `moonshotai/kimi-k2.6` — so dedup case-insensitively
+// and keep the all-lowercase spelling, which is what every other ID uses. Model
+// IDs go out on the wire, so this picks a spelling rather than folding case.
 function mapCatalog(data: TensorXModel[]): RegisteredModel[] {
-	const seen = new Set<string>();
-	const models: RegisteredModel[] = [];
+	const byKey = new Map<string, RegisteredModel>();
 	for (const model of data) {
 		const registeredModel = toRegisteredModel(model);
-		if (!registeredModel || seen.has(registeredModel.id)) continue;
-		seen.add(registeredModel.id);
-		models.push(registeredModel);
+		if (!registeredModel) continue;
+		const key = registeredModel.id.toLowerCase();
+		const existing = byKey.get(key);
+		// Keep the first entry unless a later one is the lowercase spelling.
+		if (existing && (existing.id === key || registeredModel.id !== key)) continue;
+		byKey.set(key, registeredModel);
 	}
-	return models;
+	return [...byKey.values()];
 }
 
 async function fetchModels(apiKey: string, signal?: AbortSignal): Promise<RegisteredModel[] | undefined> {
@@ -115,13 +137,15 @@ async function fetchModels(apiKey: string, signal?: AbortSignal): Promise<Regist
 
 		return mapCatalog(response.data);
 	} catch (error) {
-		console.warn(`[${PROVIDER_NAME}] Failed to fetch models:`, error);
+		if (signal?.aborted) {
+			console.warn(`[${PROVIDER_NAME}] Model catalog fetch aborted; keeping the current list`);
+		} else {
+			console.warn(`[${PROVIDER_NAME}] Failed to fetch models:`, error);
+		}
 		return undefined;
 	}
 }
 
-// pi hands the resolved credential to refreshModels() rather than exposing it
-// to extensions ambiently, so these types come from the hook's own signature.
 // Derived from ProviderConfig to avoid a direct @earendil-works/pi-ai dependency.
 type RefreshContext = Parameters<NonNullable<ProviderConfig["refreshModels"]>>[0];
 type StoredCatalog = NonNullable<Parameters<RefreshContext["publish"]>[0]["persist"]>;
@@ -161,13 +185,26 @@ function fromStoredModel(model: StoredModel): RegisteredModel {
 // after credential changes, and with it when the user opens /model or runs
 // `pi update --models`. Persisting means the next session starts from the live
 // catalog instead of the snapshot.
+//
+// context.credential carries whatever pi resolved for this provider: a key saved
+// through /login, or TENSORX_API_KEY via the `$TENSORX_API_KEY` registration
+// below — pi's api-key auth falls back to the env var itself, so there is no
+// need to read process.env here.
 async function refreshModels(context: RefreshContext): Promise<RegisteredModel[]> {
 	const stored = context.stored?.models;
-	if (stored?.length) currentModels = stored.map(fromStoredModel);
+	// Publish the restore rather than assigning directly: publication is
+	// generation-checked, so a superseded refresh can't overwrite a newer list.
+	if (stored?.length) {
+		const restored = stored.map(fromStoredModel);
+		const published = await context.publish({
+			update: () => {
+				currentModels = restored;
+			},
+		});
+		if (!published) return currentModels;
+	}
 
-	// A key from /login arrives on the context; the env var stays supported so
-	// TENSORX_API_KEY keeps working for anyone already relying on it.
-	const apiKey = credentialApiKey(context.credential) ?? process.env[API_KEY_ENV_VAR];
+	const apiKey = credentialApiKey(context.credential);
 	if (!context.allowNetwork || !apiKey) return currentModels;
 
 	const fetched = await fetchModels(apiKey, context.signal);
@@ -186,10 +223,12 @@ async function refreshModels(context: RefreshContext): Promise<RegisteredModel[]
 
 // Snapshot of the tool-capable TensorX catalog, in the API's native shape so it
 // runs through the same mapCatalog() as the live fetch. The catalog endpoint
-// needs an API key that pi does not expose to extensions, so without
-// TENSORX_API_KEY in the environment the live fetch can't run — this snapshot is
-// what gets registered then, which is also what makes TensorX show up under
-// /login → API Keys (pi only lists providers that have at least one model).
+// needs an API key, and at load time there is no session context to resolve one
+// from — only the process environment — so without TENSORX_API_KEY the live
+// fetch can't run here. This snapshot is what gets registered then, which is
+// also what makes TensorX show up under /login → API Keys (pi only lists
+// providers that have at least one model). refreshModels() takes over from
+// there, with the credential pi resolved.
 // Regenerate from `GET /v1/model/info` when the catalog changes.
 const FALLBACK_CATALOG: TensorXModel[] = [
 	{ model_name: "deepseek-v4-flash-backup", model_info: { max_input_tokens: 1048576, max_output_tokens: 384000, supports_function_calling: true, supports_reasoning: true, input_cost_per_token: 1.5e-07, output_cost_per_token: 3e-07, cache_read_input_token_cost: 3.75e-08, cache_creation_input_token_cost: 1.875e-07 } },
@@ -232,8 +271,12 @@ export default async function (pi: ExtensionAPI) {
 	// environment); otherwise register the bundled snapshot so TensorX still
 	// appears under /login → API Keys and is usable with a saved key.
 	// refreshModels() replaces this with the persisted catalog once there is one.
+	//
+	// pi awaits this factory, so a hung endpoint would hang startup: the fetch
+	// gets a deadline, and a timeout falls through to the snapshot.
 	const envApiKey = process.env[API_KEY_ENV_VAR];
-	currentModels = (envApiKey && (await fetchModels(envApiKey))) || mapCatalog(FALLBACK_CATALOG);
+	const live = envApiKey && (await fetchModels(envApiKey, AbortSignal.timeout(LOAD_FETCH_TIMEOUT_MS)));
+	currentModels = live || mapCatalog(FALLBACK_CATALOG);
 
 	pi.registerProvider(PROVIDER_NAME, {
 		name: PROVIDER_DISPLAY_NAME,
