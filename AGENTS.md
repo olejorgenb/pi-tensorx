@@ -30,6 +30,23 @@ Model IDs are the reason this matters: TensorX renames and retires models, and a
 
 Inference uses a saved API key from `/login` or `TENSORX_API_KEY`. The extension also registers `/tensorx-models`, which lists `currentModels` so it reflects refreshes.
 
+## Rate-limit errors
+
+The extension registers a `streamSimple` handler whose only job is to inject a `fetch` wrapper (`withRateLimitDetail()`) and hand the call to pi's own `openai-completions` implementation, imported as `openAICompletionsApi()` from `@earendil-works/pi-ai/compat` — the specifier pi's extension loader aliases to its bundled copy (`VIRTUAL_MODULES` / `getAliases()` in `core/extensions/loader.ts`), and the same one pi's own `agent-session.ts` uses.
+
+`completionsApi` is cast to the `ProviderConfig["streamSimple"]` shape on purpose. At runtime there is a single pi-ai — the loader aliases both this package's import and pi-coding-agent's to its bundled copy — but at build time npm may hoist a second copy for this package's devDependency (it currently resolves 0.84.2 while pi-coding-agent pins 0.84.1), and `AssistantMessageEventStream` has a private field, so the two declarations are nominally incompatible and `tsc` rejects the assignment. The cast drops pi-ai's own signature and keeps the one pi actually calls.
+
+A fetch wrapper is the only place a 429 can be explained. The OpenAI SDK raises an `APIError` for any non-2xx before `withResponse()` resolves, so pi's `onResponse` — and with it the `after_provider_response` extension event — never runs, and `retry-after` / `x-ratelimit-*` are lost. pi then renders the failure with `formatProviderError()` (`packages/ai/src/utils/error-body.ts`), which prefers the parsed body over the SDK's message, producing the raw `429: {"message":...}` dump.
+
+Two details in `withRateLimitDetail()` are load-bearing:
+
+- The replacement body is **plain text**, not JSON. `formatProviderError()` prints `<status>: <JSON body>` when the SDK parsed a body object, but returns the SDK's own message when it did not — and for a non-JSON body the SDK folds the text into that message verbatim. Plain text is what turns the output into a sentence instead of a blob.
+- The wording must keep "rate limit" and must avoid billing/quota vocabulary. `isRetryableAssistantError()` (`packages/ai/src/utils/retry.ts`) classifies a failed turn by regex over the error text: `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (`billing`, `quota exceeded`, `out of budget`, `available balance`, `insufficient_quota`) is tested first and wins, then `RETRYABLE_PROVIDER_ERROR_PATTERN` (`rate.?limit`, `429`, ...). Wording the message as a spend problem would silently disable pi's retry of a transient throttle.
+
+The original response headers are preserved on the replacement `Response` (minus `content-length` / `content-encoding`, which described the body that was replaced) so pi's provider-level retry can still read `retry-after` when `retry.provider.maxRetries` is raised above its default of `0`.
+
+Note that pi routes `provider.stream()` through the extension's `streamSimple` too (`composeModelProvider()` in `core/provider-composer.ts`); nothing in pi calls it today — `sdk.ts` streams via `streamSimple` — so the option shapes cannot diverge in practice.
+
 ## Development commands
 
 ```bash

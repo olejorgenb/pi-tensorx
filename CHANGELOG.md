@@ -7,6 +7,7 @@
 - De-duplicates model IDs that differ only in case, keeping the all-lowercase spelling, so models like `moonshotai/kimi-k2.6` no longer appear twice in the model picker.
 - Warns instead of silently pricing a model at zero when the catalog reports an unparsable `*_cost_per_token` value.
 - Removes the bundled catalog snapshot. It existed because pi was believed to list only providers with at least one registered model under `/login`; that is not the case in pi 0.84, so the provider now registers with the catalog persisted from an earlier session — or with no models at all — when no key is available at load, and `refreshModels()` populates it once one exists. This drops a copy of the catalog that could — and did — drift from the live pricing data.
+- Explains a rate-limited request instead of dumping the raw 429 body. The extension now registers a `streamSimple` handler that wraps pi's `openai-completions` implementation with a `fetch` that rewrites a 429 into one line naming the limit that was hit, the `retry-after` delay, the reset time, and the remaining request/token headroom — none of which reached the user before, because the OpenAI SDK folds the response into an error before pi's `after_provider_response` hook can read the headers. Catalog fetches that get throttled log the same detail.
 
 ## 1.1.0 - 2026-08-09
 

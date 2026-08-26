@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 
@@ -13,6 +14,13 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32768;
 // TensorX reports costs per token; pi expects cost per million tokens.
 const COST_PER_MILLION = 1_000_000;
+const RATE_LIMIT_DOCS_URL = "https://docs.tensorx.ai/api-reference/rate-limits";
+// The `reason` field of a 429 body names the limit that was hit.
+const RATE_LIMIT_REASONS: Record<string, string> = {
+	rate_limit_requests: "requests per minute",
+	rate_limit_tokens: "tokens per minute",
+	rate_limit_concurrent: "concurrent requests",
+};
 
 // The TensorX catalog endpoint is not always reliable (timeouts, 5xx, rate
 // limits), so catalog fetches get a per-attempt timeout and retry transient
@@ -70,6 +78,60 @@ function tokenCostToMillions(raw: number | string | null | undefined, field: str
 	// Say so rather than silently reporting the model as free.
 	console.warn(`[${PROVIDER_NAME}] ${modelId}: unparsable ${field} (${JSON.stringify(raw)}), treating as 0`);
 	return 0;
+}
+
+// A 429 body is `{"error": {"message", "type", "code", "reason"}}`, but the
+// wrapping `error` key has not always been there, so accept a flat body too.
+function parseRateLimitBody(body: string): { message?: string; reason?: string } {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(body);
+	} catch {
+		return {};
+	}
+	if (typeof parsed !== "object" || parsed === null) return {};
+	const record = parsed as Record<string, unknown>;
+	const error = (typeof record.error === "object" && record.error !== null ? record.error : record) as Record<
+		string,
+		unknown
+	>;
+	return {
+		message: typeof error.message === "string" ? error.message : undefined,
+		reason: typeof error.reason === "string" ? error.reason : undefined,
+	};
+}
+
+function formatHeadroom(headers: Headers, kind: "requests" | "tokens"): string | undefined {
+	const remaining = headers.get(`x-ratelimit-remaining-${kind}`);
+	const limit = headers.get(`x-ratelimit-limit-${kind}`);
+	if (remaining === null && limit === null) return undefined;
+	if (remaining !== null && limit !== null) return `${remaining}/${limit} ${kind} left`;
+	return remaining === null ? `limit ${limit} ${kind}` : `${remaining} ${kind} left`;
+}
+
+// Fold the rate-limit headers and the `reason` field into one sentence.
+//
+// Keep the words "rate limit" in it: pi decides whether to retry a failed turn
+// by pattern-matching the error text (`isRetryableAssistantError()` in pi-ai's
+// `utils/retry.ts`). By the same token, do not describe the limit in terms of
+// billing or quota — those words mark an error as *non*-retryable there, and a
+// throttle is exactly the case pi should retry.
+function describeRateLimit(headers: Headers, body: string): string {
+	const { message, reason } = parseRateLimitBody(body);
+	const limit = reason ? (RATE_LIMIT_REASONS[reason] ?? reason) : undefined;
+
+	const parts = [limit ? `TensorX rate limit exceeded (${limit})` : "TensorX rate limit exceeded"];
+	const retryAfter = headers.get("retry-after");
+	if (retryAfter) parts.push(`retry after ${retryAfter}s`);
+	const reset = headers.get("x-ratelimit-reset");
+	if (reset) parts.push(`resets ${reset}`);
+	const requests = formatHeadroom(headers, "requests");
+	if (requests) parts.push(requests);
+	const tokens = formatHeadroom(headers, "tokens");
+	if (tokens) parts.push(tokens);
+
+	const detail = `${parts.join("; ")}. Limits scale with spend: ${RATE_LIMIT_DOCS_URL}`;
+	return message ? `${detail} — TensorX said: ${message}` : detail;
 }
 
 function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
@@ -195,7 +257,11 @@ async function attemptFetch(
 	}
 
 	if (!response.ok) {
-		const reason = `API returned ${response.status} ${response.statusText}`;
+		// A throttled refresh is worth explaining too: it is the same 429, and
+		// "API returned 429" alone does not say when the catalog can be fetched.
+		const detail =
+			response.status === 429 ? ` — ${describeRateLimit(response.headers, await response.text())}` : "";
+		const reason = `API returned ${response.status} ${response.statusText}${detail}`;
 		// 429 and 5xx are transient; other 4xx (bad key, unknown endpoint) will
 		// not succeed on retry.
 		if (response.status === 429 || response.status >= 500) return { kind: "retryable", reason };
@@ -375,6 +441,58 @@ async function refreshModels(context: RefreshContext): Promise<RegisteredModel[]
 	return fetched;
 }
 
+type FetchFunction = typeof globalThis.fetch;
+
+// Rewrite a 429 body into one readable sentence.
+//
+// Inference errors reach the user as `429: <body>`: pi's openai-completions
+// adapter composes that from the OpenAI SDK's APIError, which is raised before
+// pi's `after_provider_response` hook runs, so the `retry-after` and
+// `x-ratelimit-*` headers never surface anywhere. A fetch wrapper is the one
+// place where the headers and the body are both still in hand.
+//
+// The replacement body is plain text on purpose: the SDK folds a non-JSON body
+// into the error message verbatim, while a JSON one is re-serialized and
+// printed as a blob — which is what made the original message unreadable.
+function withRateLimitDetail(inner: FetchFunction = fetch): FetchFunction {
+	return async (input, init) => {
+		const response = await inner(input, init);
+		if (response.status !== 429) return response;
+
+		const body = await response.text();
+		// Keep the original headers so pi's provider-level retry can still read
+		// `retry-after`, but drop the ones that described the body we replaced.
+		const headers = new Headers(response.headers);
+		headers.set("content-type", "text/plain; charset=utf-8");
+		headers.delete("content-length");
+		headers.delete("content-encoding");
+
+		return new Response(describeRateLimit(response.headers, body), {
+			status: response.status,
+			statusText: response.statusText,
+			headers,
+		});
+	};
+}
+
+type StreamSimple = NonNullable<ProviderConfig["streamSimple"]>;
+
+// pi has no hook for the provider's HTTP responses, so the extension takes over
+// the stream call to inject the fetch above and hands it straight back to pi's
+// own openai-completions implementation.
+//
+// The cast keeps the type universes apart. At runtime there is one pi-ai: pi's
+// loader aliases both `@earendil-works/pi-ai` and pi-coding-agent's own import
+// to its bundled copy. At build time npm may hoist a second copy for this
+// package's devDependency, and the two declarations of
+// `AssistantMessageEventStream` are then nominally distinct (it has a private
+// field). `ProviderConfig["streamSimple"]` — the signature pi actually calls —
+// stays the checked one.
+const completionsApi = openAICompletionsApi() as unknown as { streamSimple: StreamSimple };
+
+const streamSimple: StreamSimple = (model, context, options) =>
+	completionsApi.streamSimple(model, context, { ...options, fetch: withRateLimitDetail(options?.fetch) });
+
 export default async function (pi: ExtensionAPI) {
 	// Pi does not invoke refreshModels in non-interactive modes (e.g.
 	// `pi --list-models`), so pre-fetch with the environment key when it is set —
@@ -406,6 +524,7 @@ export default async function (pi: ExtensionAPI) {
 		api: PROVIDER_API,
 		models: currentModels,
 		refreshModels,
+		streamSimple,
 	});
 
 	pi.registerCommand("tensorx-models", {

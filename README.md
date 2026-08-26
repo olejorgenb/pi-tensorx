@@ -78,6 +78,18 @@ This matters because the catalog is the source of truth for model IDs: TensorX r
 
 Inference needs either a saved API key from `/login` or `TENSORX_API_KEY`.
 
+### Rate limits
+
+TensorX throttles per API key (60 requests/minute and 2M tokens/minute by default, rising with spend — see [the rate limit docs](https://docs.tensorx.ai/api-reference/rate-limits)). A throttled request would otherwise surface as `429: {"message":"Rate limit exceeded. Please slow down and retry.", ...}`, dumping the raw response body while dropping the `retry-after` and `x-ratelimit-*` headers that say when to try again — pi's provider adapter never sees them, because the OpenAI SDK raises the error before pi's response hook runs.
+
+The extension therefore wraps the provider's HTTP calls and rewrites a 429 into a single line:
+
+```
+429 TensorX rate limit exceeded (requests per minute); retry after 12s; resets 2026-08-26T20:15:00Z; 0/60 requests left; 1980000/2000000 tokens left. Limits scale with spend: https://docs.tensorx.ai/api-reference/rate-limits — TensorX said: Rate limit exceeded. Please slow down and retry.
+```
+
+Every part except the first is optional and appears only when TensorX sends the matching header or the `reason` field. pi still retries a throttled turn on its own (three attempts, 2s/4s/8s apart, configurable via `retry.maxRetries` and `retry.baseDelayMs` in pi's settings). Setting `retry.provider.maxRetries` above `0` adds SDK-level retries that honor the `retry-after` header, at the cost of pi seeing the error later.
+
 ## Development
 
 ```bash
