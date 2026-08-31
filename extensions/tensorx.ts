@@ -52,10 +52,14 @@ interface TensorXModel {
 	model_info?: TensorXModelInfo;
 }
 
+// Derived from ProviderConfig to avoid a direct @earendil-works/pi-ai dependency.
+type ThinkingLevelMap = NonNullable<NonNullable<ProviderConfig["models"]>[number]["thinkingLevelMap"]>;
+
 type RegisteredModel = {
 	id: string;
 	name: string;
 	reasoning: boolean;
+	thinkingLevelMap?: ThinkingLevelMap;
 	input: ("text" | "image")[];
 	cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow: number;
@@ -69,6 +73,42 @@ const MODEL_COMPAT = {
 	supportsDeveloperRole: false,
 	maxTokensField: "max_tokens",
 } as const satisfies RegisteredModel["compat"];
+
+// Which `reasoning_effort` values a model accepts, keyed by pi thinking level.
+// `null` marks a level as unsupported (pi hides it and clamps a saved setting
+// to the nearest available one); a string is sent instead of the level's own
+// name; a missing key means "send the level as-is", pi's default.
+//
+// Nothing in the catalog carries this — see the note in AGENTS.md — so the
+// entries below come from probing `/v1/chat/completions` with each level. Only
+// models that reject a level pi would otherwise offer are listed; everything
+// else keeps pi's defaults.
+const MODEL_THINKING_LEVELS: { prefix: string; map: ThinkingLevelMap }[] = [
+	{
+		// qwen3.8 takes low/medium/xhigh only, and defaults to xhigh. `off`
+		// mapping to "none" is probed-accepted, not verified to disable
+		// thinking — but without it `off` sent nothing and the model went on
+		// reasoning at its default.
+		prefix: "qwen/qwen3.8-2.4t-a95b",
+		map: { off: null, minimal: null, high: null, xhigh: "xhigh" },
+	},
+	{
+		prefix: "qwen/qwen3.8",
+		map: { off: "none", minimal: null, high: null, xhigh: "xhigh" },
+	},
+	{
+		// Rejects "minimal"; low/medium/high/none all work.
+		prefix: "z-ai/glm-5.1",
+		map: { minimal: null },
+	},
+];
+
+// Match on the lowercased ID: `toRegisteredModel()` runs before mapCatalog()
+// folds case, and the catalog has shipped mixed-case IDs.
+function thinkingLevelMapFor(modelId: string): ThinkingLevelMap | undefined {
+	const id = modelId.toLowerCase();
+	return MODEL_THINKING_LEVELS.find((entry) => id.startsWith(entry.prefix))?.map;
+}
 
 function tokenCostToMillions(raw: number | string | null | undefined, field: string, modelId: string): number {
 	if (raw === null || raw === undefined) return 0;
@@ -146,6 +186,7 @@ function toRegisteredModel(model: TensorXModel): RegisteredModel | undefined {
 		id: model.model_name,
 		name: model.model_name,
 		reasoning: info.supports_reasoning === true,
+		thinkingLevelMap: thinkingLevelMapFor(model.model_name),
 		input,
 		cost: {
 			input: tokenCostToMillions(info.input_cost_per_token, "input_cost_per_token", model.model_name),
@@ -381,12 +422,15 @@ function toStoredModel(model: RegisteredModel): StoredModel {
 }
 
 // Drops the provider-level fields toStoredModel() baked in; pi reapplies them
-// from the registration when the returned list is composed.
+// from the registration when the returned list is composed. The thinking-level
+// map is re-derived from the ID rather than read back, so a stored catalog
+// written by an older version of the table picks up the current one.
 function fromStoredModel(model: StoredModel): RegisteredModel {
 	return {
 		id: model.id,
 		name: model.name,
 		reasoning: model.reasoning,
+		thinkingLevelMap: thinkingLevelMapFor(model.id),
 		input: model.input,
 		cost: model.cost,
 		contextWindow: model.contextWindow,
